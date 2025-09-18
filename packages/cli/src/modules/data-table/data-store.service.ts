@@ -10,7 +10,14 @@ import type {
 	UpdateDataTableRowDto,
 } from '@n8n/api-types';
 import { Logger } from '@n8n/backend-common';
+import { ProjectRelationRepository, type User } from '@n8n/db';
 import { Service } from '@n8n/di';
+import {
+	PROJECT_ADMIN_ROLE_SLUG,
+	PROJECT_EDITOR_ROLE_SLUG,
+	PROJECT_OWNER_ROLE_SLUG,
+	PROJECT_VIEWER_ROLE_SLUG,
+} from '@n8n/permissions';
 import { DateTime } from 'luxon';
 import type {
 	DataStoreColumnJsType,
@@ -20,8 +27,12 @@ import type {
 	DataStoreRows,
 	DataTableInsertRowsReturnType,
 	DataTableInsertRowsResult,
+	DataTablesSizeResult,
+	DataTableInfoById,
 } from 'n8n-workflow';
 import { validateFieldType } from 'n8n-workflow';
+
+import { userHasScopes } from '@/permissions.ee/check-access';
 
 import { DataStoreColumnRepository } from './data-store-column.repository';
 import { DataStoreRowsRepository } from './data-store-rows.repository';
@@ -43,6 +54,7 @@ export class DataStoreService {
 		private readonly dataStoreRowsRepository: DataStoreRowsRepository,
 		private readonly logger: Logger,
 		private readonly dataStoreSizeValidator: DataStoreSizeValidator,
+		private readonly projectRelationRepository: ProjectRelationRepository,
 	) {
 		this.logger = this.logger.scoped('data-table');
 	}
@@ -53,7 +65,11 @@ export class DataStoreService {
 	async createDataStore(projectId: string, dto: CreateDataStoreDto) {
 		await this.validateUniqueName(dto.name, projectId);
 
-		return await this.dataStoreRepository.createDataStore(projectId, dto.name, dto.columns);
+		const result = await this.dataStoreRepository.createDataStore(projectId, dto.name, dto.columns);
+
+		this.dataStoreSizeValidator.reset();
+
+		return result;
 	}
 
 	// Updates data store properties (currently limited to renaming)
@@ -67,17 +83,31 @@ export class DataStoreService {
 	}
 
 	async deleteDataStoreByProjectId(projectId: string) {
-		return await this.dataStoreRepository.deleteDataStoreByProjectId(projectId);
+		const result = await this.dataStoreRepository.deleteDataStoreByProjectId(projectId);
+
+		if (result) {
+			this.dataStoreSizeValidator.reset();
+		}
+
+		return result;
 	}
 
 	async deleteDataStoreAll() {
-		return await this.dataStoreRepository.deleteDataStoreAll();
+		const result = await this.dataStoreRepository.deleteDataStoreAll();
+
+		if (result) {
+			this.dataStoreSizeValidator.reset();
+		}
+
+		return result;
 	}
 
 	async deleteDataStore(dataStoreId: string, projectId: string) {
 		await this.validateDataStoreExists(dataStoreId, projectId);
 
 		await this.dataStoreRepository.deleteDataStore(dataStoreId);
+
+		this.dataStoreSizeValidator.reset();
 
 		return true;
 	}
@@ -160,7 +190,8 @@ export class DataStoreService {
 	) {
 		await this.validateDataTableSize();
 		await this.validateDataStoreExists(dataStoreId, projectId);
-		return await this.dataStoreColumnRepository.manager.transaction(async (em) => {
+
+		const result = await this.dataStoreColumnRepository.manager.transaction(async (em) => {
 			const columns = await this.dataStoreColumnRepository.getColumns(dataStoreId, em);
 			this.validateRowsWithColumns(rows, columns);
 
@@ -172,6 +203,10 @@ export class DataStoreService {
 				em,
 			);
 		});
+
+		this.dataStoreSizeValidator.reset();
+
+		return result;
 	}
 
 	async upsertRow<T extends boolean | undefined>(
@@ -189,7 +224,7 @@ export class DataStoreService {
 		await this.validateDataTableSize();
 		await this.validateDataStoreExists(dataTableId, projectId);
 
-		return await this.dataStoreColumnRepository.manager.transaction(async (em) => {
+		const result = await this.dataStoreColumnRepository.manager.transaction(async (em) => {
 			const columns = await this.dataStoreColumnRepository.getColumns(dataTableId, em);
 			this.validateUpdateParams(dto, columns);
 			const updated = await this.dataStoreRowsRepository.updateRow(
@@ -215,6 +250,10 @@ export class DataStoreService {
 			);
 			return returnData ? inserted : true;
 		});
+
+		this.dataStoreSizeValidator.reset();
+
+		return result;
 	}
 
 	validateUpdateParams(
@@ -253,7 +292,7 @@ export class DataStoreService {
 		await this.validateDataTableSize();
 		await this.validateDataStoreExists(dataTableId, projectId);
 
-		return await this.dataStoreColumnRepository.manager.transaction(async (em) => {
+		const result = await this.dataStoreColumnRepository.manager.transaction(async (em) => {
 			const columns = await this.dataStoreColumnRepository.getColumns(dataTableId, em);
 			this.validateUpdateParams(dto, columns);
 			return await this.dataStoreRowsRepository.updateRow(
@@ -265,6 +304,10 @@ export class DataStoreService {
 				em,
 			);
 		});
+
+		this.dataStoreSizeValidator.reset();
+
+		return result;
 	}
 
 	async deleteRows<T extends boolean | undefined>(
@@ -302,6 +345,9 @@ export class DataStoreService {
 			dto.filter,
 			returnData,
 		);
+
+		this.dataStoreSizeValidator.reset();
+
 		return returnData ? result : true;
 	}
 
@@ -456,14 +502,46 @@ export class DataStoreService {
 		);
 	}
 
-	async getDataTablesSize() {
-		const sizeData = await this.dataStoreSizeValidator.getCachedSizeData(
+	async getDataTablesSize(user: User): Promise<DataTablesSizeResult> {
+		const allSizeData = await this.dataStoreSizeValidator.getCachedSizeData(
 			async () => await this.dataStoreRepository.findDataTablesSize(),
 		);
+
+		// Check permissions and filter the data
+		const canAccessDataTables = await userHasScopes(user, ['dataStore:list'], false, {});
+
+		if (!canAccessDataTables) {
+			return {
+				totalBytes: allSizeData.totalBytes,
+				quotaStatus: this.dataStoreSizeValidator.sizeToState(allSizeData.totalBytes),
+				dataTables: {},
+			};
+		}
+
+		// DB query will filter projects where the user actually has these roles
+		const roles = [
+			PROJECT_OWNER_ROLE_SLUG,
+			PROJECT_ADMIN_ROLE_SLUG,
+			PROJECT_EDITOR_ROLE_SLUG,
+			PROJECT_VIEWER_ROLE_SLUG,
+		];
+		const accessibleProjectIds = await this.projectRelationRepository.getAccessibleProjectsByRoles(
+			user.id,
+			roles,
+		);
+
+		// Filter the cached data based on user's accessible projects
+		const accessibleDataTables: DataTableInfoById = {};
+		for (const [dataTableId, dataTableInfo] of Object.entries(allSizeData.dataTables)) {
+			if (accessibleProjectIds.includes(dataTableInfo.projectId)) {
+				accessibleDataTables[dataTableId] = dataTableInfo;
+			}
+		}
+
 		return {
-			sizeBytes: sizeData.totalBytes,
-			sizeState: this.dataStoreSizeValidator.sizeToState(sizeData.totalBytes),
-			dataTables: sizeData.dataTables,
+			totalBytes: allSizeData.totalBytes,
+			quotaStatus: this.dataStoreSizeValidator.sizeToState(allSizeData.totalBytes),
+			dataTables: accessibleDataTables,
 		};
 	}
 }
