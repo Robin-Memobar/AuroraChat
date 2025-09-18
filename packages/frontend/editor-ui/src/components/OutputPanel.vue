@@ -386,7 +386,7 @@ function handleChangeCollapsingColumn(columnName: string | null) {
 					<template v-else #icon>
 						<N8nIcon icon="arrow-right-from-line" size="xlarge" />
 					</template>
-					<template #description>
+					<template #default>
 						<I18nT
 							tag="span"
 							:keypath="
