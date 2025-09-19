@@ -1,0 +1,381 @@
+{
+  "name": "AuroraChat Onboarding (Scrape + Embed)",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "onboard",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "996438a7-7991-498b-ae88-17e693aafa65",
+      "name": "Onboard Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        200
+      ],
+      "webhookId": "aurorachat-onboard"
+    },
+    {
+      "parameters": {
+        "functionCode": "const [{ json }] = items;\nconst tenantId = json.tenant_id;\nconst domain = (json.domain || '').trim();\n\nif (!tenantId || !domain) {\n  throw new Error('tenant_id and domain are required');\n}\n\nconst normalizeProtocol = (value) => {\n  const trimmed = value.replace(/\\s+/g, '').replace(/\\/+$/, '');\n  if (!/^https?:\\/\\//i.test(trimmed)) {\n    return `https://${trimmed}`;\n  }\n  return trimmed.replace(/^http:\\/\\//i, 'https://');\n};\n\nconst normalizedDomain = normalizeProtocol(domain);\n\n$flow.set('tenant_id', tenantId);\n$flow.set('domain', normalizedDomain);\n\nreturn [\n  {\n    json: {\n      tenant_id: tenantId,\n      domain: normalizedDomain,\n    },\n  },\n];"
+      },
+      "id": "f5ada78d-60a9-45e2-a6fe-41b05613a6e7",
+      "name": "Normalize Input",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        460,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.scrappey.com/scrape",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"url\": $json[\"domain\"], \"depth\": 2, \"extractText\": true } }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "c4ddff65-2736-48ce-8c7f-376f4a0665d4",
+      "name": "Scrape Website",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        740,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const tenantId = $flow.get('tenant_id');\nconst pages = items[0].json?.result?.pages || items[0].json?.pages || [];\n\nconst normalized = [];\n\nfor (const page of pages) {\n  if (!page) continue;\n  const text = page.text || page.content || '';\n  if (!text.trim()) continue;\n\n  normalized.push({\n    tenant_id: tenantId,\n    source_url: page.url || page.source_url || '',\n    title: page.title || page.url || 'Untitled Page',\n    text,\n  });\n}\n\nreturn normalized.map((entry) => ({ json: entry }));"
+      },
+      "id": "f7566f2d-6160-4aab-ba5c-a5425055be3a",
+      "name": "Normalize Pages",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1020,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const chunkSize = 1200;\nconst overlap = 200;\nconst chunks = [];\n\nfor (const item of items) {\n  const { tenant_id, source_url, title, text } = item.json;\n  if (!text) continue;\n\n  const cleaned = text.replace(/\\s+/g, ' ').trim();\n  if (!cleaned) continue;\n\n  let index = 0;\n  for (let start = 0; start < cleaned.length; start += chunkSize - overlap) {\n    const end = Math.min(cleaned.length, start + chunkSize);\n    const content = cleaned.slice(start, end);\n    chunks.push({\n      json: {\n        tenant_id,\n        source_url,\n        title,\n        content,\n        chunk_index: index,\n      },\n    });\n    if (end === cleaned.length) break;\n    index += 1;\n  }\n}\n\nreturn chunks;"
+      },
+      "id": "15866af5-c289-4f44-9514-6bc46e5d7671",
+      "name": "Chunk Content",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1300,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO docs (tenant_id, source_url, title, content, chunk_index)\nVALUES ($1::uuid, $2, $3, $4, $5::int)\nON CONFLICT (tenant_id, source_url, chunk_index)\nDO UPDATE SET\n  title = EXCLUDED.title,\n  content = EXCLUDED.content\nRETURNING id AS doc_id, tenant_id, source_url, title, content, chunk_index;",
+        "options": {
+          "queryBatching": "independently",
+          "queryReplacement": "={{$json[\"tenant_id\"]}},{{$json[\"source_url\"]}},{{$json[\"title\"]}},{{$json[\"content\"]}},{{$json[\"chunk_index\"]}}"
+        }
+      },
+      "id": "43c3bb61-db9e-46de-b829-5fd945a13145",
+      "name": "Upsert Docs",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.3,
+      "position": [
+        1580,
+        200
+      ],
+      "credentials": {
+        "postgres": "Supabase Postgres"
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "return items.map((item) => {\n  const { tenant_id, doc_id, source_url, title, content, chunk_index } = item.json;\n  return {\n    json: {\n      tenant_id,\n      doc_id,\n      source_url,\n      title,\n      content,\n      chunk_index,\n      embeddingRequest: {\n        model: 'text-embedding-3-small',\n        input: content,\n      },\n    },\n  };\n});"
+      },
+      "id": "8f43b343-4d47-49ac-94f2-639953e3763a",
+      "name": "Prepare Embedding Payload",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1860,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/embeddings",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ $json[\"embeddingRequest\"] }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "09a801e5-c535-45e7-8b22-b4e4be30f1d8",
+      "name": "Create Chunk Embedding",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        2140,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combinationMode": "mergeByPosition",
+        "options": {}
+      },
+      "id": "57f6df06-a9e3-485d-9c3a-4154c6d251d8",
+      "name": "Merge Chunk + Embedding",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 2.2,
+      "position": [
+        2420,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const results = [];\n\nfor (const item of items) {\n  const embedding = item.json.data?.[0]?.embedding;\n  if (!Array.isArray(embedding) || embedding.length === 0) {\n    throw new Error('OpenAI embedding response is missing data');\n  }\n\n  const record = {\n    tenant_id: item.json.tenant_id,\n    doc_id: item.json.doc_id,\n    chunk_index: item.json.chunk_index,\n    source_url: item.json.source_url,\n    title: item.json.title,\n    embedding,\n    embedding_literal: `[${embedding.join(',')}]`,\n  };\n\n  results.push({ json: record });\n}\n\nreturn results;"
+      },
+      "id": "eb14a757-f3e6-4670-93d6-cd4f5489378f",
+      "name": "Prepare Embedding Record",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        2700,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO doc_embeddings (tenant_id, doc_id, chunk_index, embedding)\nVALUES ($1::uuid, $2::uuid, $3::int, $4::vector)\nON CONFLICT (doc_id, chunk_index)\nDO UPDATE SET\n  embedding = EXCLUDED.embedding\nRETURNING $1::uuid AS tenant_id, $2::uuid AS doc_id, $3::int AS chunk_index, $5 AS source_url, $6 AS title;",
+        "options": {
+          "queryBatching": "independently",
+          "queryReplacement": "={{$json[\"tenant_id\"]}},{{$json[\"doc_id\"]}},{{$json[\"chunk_index\"]}},{{$json[\"embedding_literal\"]}},{{$json[\"source_url\"]}},{{$json[\"title\"]}}"
+        }
+      },
+      "id": "c4a3b863-0d07-4eec-925f-bcccfdd644bd",
+      "name": "Store Embedding",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.3,
+      "position": [
+        2980,
+        200
+      ],
+      "credentials": {
+        "postgres": "Supabase Postgres"
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "const tenantId = $flow.get('tenant_id');\nconst summary = {\n  tenant_id: tenantId,\n  chunks_processed: items.length,\n  sources: [],\n};\n\nconst seen = new Set();\n\nfor (const item of items) {\n  const { source_url, title } = item.json;\n  if (source_url && !seen.has(source_url)) {\n    seen.add(source_url);\n    summary.sources.push({\n      source_url,\n      title,\n    });\n  }\n}\n\nreturn [\n  {\n    json: {\n      status: 'success',\n      ...summary,\n    },\n  },\n];"
+      },
+      "id": "4537e73d-950b-4228-9e48-59ed2df55d9c",
+      "name": "Summarize Onboarding",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        3260,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "responseBody": "={{ $json }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "7d76c338-cab4-46a7-b7b1-308bce1ebe29",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        3540,
+        200
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Onboard Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Input": {
+      "main": [
+        [
+          {
+            "node": "Scrape Website",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Scrape Website": {
+      "main": [
+        [
+          {
+            "node": "Normalize Pages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Pages": {
+      "main": [
+        [
+          {
+            "node": "Chunk Content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chunk Content": {
+      "main": [
+        [
+          {
+            "node": "Upsert Docs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Docs": {
+      "main": [
+        [
+          {
+            "node": "Prepare Embedding Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Embedding Payload": {
+      "main": [
+        [
+          {
+            "node": "Create Chunk Embedding",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge Chunk + Embedding",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Chunk Embedding": {
+      "main": [
+        [
+          {
+            "node": "Merge Chunk + Embedding",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Chunk + Embedding": {
+      "main": [
+        [
+          {
+            "node": "Prepare Embedding Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Embedding Record": {
+      "main": [
+        [
+          {
+            "node": "Store Embedding",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Embedding": {
+      "main": [
+        [
+          {
+            "node": "Summarize Onboarding",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summarize Onboarding": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {},
+  "versionId": "5be599ba-9f09-46cd-a7ec-3b07c70051b2",
+  "id": "2ce2b922-3cd1-4c62-8235-10d677bbc0ca",
+  "meta": {
+    "instanceId": "aurorachat-spec"
+  },
+  "tags": []
+}

@@ -1,0 +1,332 @@
+{
+  "name": "AuroraChat Chatbot (Question → Context → Answer)",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "chatbot",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "fd3239dc-370c-4b94-89bd-103ea2ce6696",
+      "name": "Chatbot Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        200
+      ],
+      "webhookId": "aurorachat-chatbot"
+    },
+    {
+      "parameters": {
+        "functionCode": "const [{ json }] = items;\nconst tenantId = json.tenant_id;\nconst question = (json.question || '').trim();\n\nif (!tenantId || !question) {\n  throw new Error('tenant_id and question are required');\n}\n\n$flow.set('tenant_id', tenantId);\n$flow.set('question', question);\n\nreturn [\n  {\n    json: {\n      tenant_id: tenantId,\n      question,\n    },\n  },\n];"
+      },
+      "id": "286fda22-d282-4e22-b6ed-a10ea9f6ac2a",
+      "name": "Prepare Question",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        480,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/embeddings",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"model\": \"text-embedding-3-small\", \"input\": $json[\"question\"] } }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "f1f5a4fd-7308-40e5-a5bb-548420d6909a",
+      "name": "Question Embedding",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        760,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combinationMode": "mergeByPosition",
+        "options": {}
+      },
+      "id": "ae8dd319-28b7-458e-9312-655f1d300313",
+      "name": "Merge Question + Embedding",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 2.2,
+      "position": [
+        1040,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const question = $flow.get('question');\nconst tenantId = $flow.get('tenant_id');\nconst embedding = items[0].json.data?.[0]?.embedding;\n\nif (!Array.isArray(embedding) || embedding.length === 0) {\n  throw new Error('Embedding missing from OpenAI response');\n}\n\nreturn [\n  {\n    json: {\n      tenant_id: tenantId || items[0].json.tenant_id,\n      question: question || items[0].json.question,\n      embedding,\n      embedding_literal: `[${embedding.join(',')}]`,\n    },\n  },\n];"
+      },
+      "id": "f49e8777-e592-42ef-9ec3-ea8d8f18d832",
+      "name": "Prepare Search",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1320,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT d.id AS doc_id, d.content, d.source_url, d.title, d.chunk_index\nFROM search_docs($1::uuid, $2::vector, 5) AS d;",
+        "options": {
+          "queryBatching": "single",
+          "queryReplacement": "={{$json[\"tenant_id\"]}},{{$json[\"embedding_literal\"]}}"
+        }
+      },
+      "id": "7665694a-1ea5-4360-916b-3533dfba9390",
+      "name": "Search Docs",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.3,
+      "position": [
+        1600,
+        200
+      ],
+      "credentials": {
+        "postgres": "Supabase Postgres"
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "const question = $flow.get('question');\nconst tenantId = $flow.get('tenant_id');\n\nif (!question) {\n  throw new Error('Question is missing from flow data');\n}\n\nconst docs = items.map((item, index) => ({\n  doc_id: item.json.doc_id,\n  content: item.json.content,\n  source_url: item.json.source_url,\n  title: item.json.title,\n  chunk_index: item.json.chunk_index,\n  rank: index + 1,\n}));\n\nconst contextSections = docs.length\n  ? docs.map((doc) => {\n      const title = doc.title || `Document ${doc.rank}`;\n      const source = doc.source_url || 'Unknown source';\n      return `(${doc.rank}) ${title} [${source}]\\n${doc.content}`;\n    })\n  : ['No relevant documents were retrieved.'];\n\nconst context = docs.length ? contextSections.join('\\n\\n') : '';\nconst userMessage = docs.length\n  ? `Question: ${question}\\nContext:\\n${context}`\n  : `Question: ${question}\\nContext: No relevant documents were retrieved.`;\n\nconst sources = Array.from(new Set(docs.map((doc) => doc.source_url).filter(Boolean)));\n\nreturn [\n  {\n    json: {\n      tenant_id: tenantId,\n      question,\n      docs,\n      context: context || 'No relevant documents were retrieved.',\n      sources,\n      messages: [\n        {\n          role: 'system',\n          content: 'You are a helpful assistant answering questions based on company docs.',\n        },\n        {\n          role: 'user',\n          content: userMessage,\n        },\n      ],\n    },\n  },\n];"
+      },
+      "id": "747c99d2-7bde-41ba-85d1-e20dcfe360be",
+      "name": "Build Prompt",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1880,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"model\": \"gpt-4o-mini\", \"messages\": $json[\"messages\"], \"temperature\": 0.2 } }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "35564c9b-6f0b-4309-a3f8-549e1dd13bfe",
+      "name": "Chat Completion",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        2160,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combinationMode": "mergeByPosition",
+        "options": {}
+      },
+      "id": "78103f4e-2d03-4d39-aaa4-51c8e5bb35a5",
+      "name": "Merge Answer",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 2.2,
+      "position": [
+        2440,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const results = [];\n\nfor (const item of items) {\n  const answer = item.json.choices?.[0]?.message?.content || '';\n  const sources = Array.from(new Set((item.json.sources || []).filter(Boolean)));\n\n  results.push({\n    json: {\n      tenant_id: item.json.tenant_id,\n      question: item.json.question,\n      answer,\n      sources,\n      context_documents: item.json.docs || [],\n    },\n  });\n}\n\nreturn results;"
+      },
+      "id": "7de11d57-3949-421d-bb39-bd1ef60c662a",
+      "name": "Format Response",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        2720,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "responseBody": "={{ $json }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "22fcb1b1-623b-449f-92f4-c7062b8ad142",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        3000,
+        200
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Chatbot Webhook": {
+      "main": [
+        [
+          {
+            "node": "Prepare Question",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Question": {
+      "main": [
+        [
+          {
+            "node": "Question Embedding",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge Question + Embedding",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Question Embedding": {
+      "main": [
+        [
+          {
+            "node": "Merge Question + Embedding",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Question + Embedding": {
+      "main": [
+        [
+          {
+            "node": "Prepare Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Search": {
+      "main": [
+        [
+          {
+            "node": "Search Docs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Docs": {
+      "main": [
+        [
+          {
+            "node": "Build Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Prompt": {
+      "main": [
+        [
+          {
+            "node": "Chat Completion",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chat Completion": {
+      "main": [
+        [
+          {
+            "node": "Merge Answer",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Answer": {
+      "main": [
+        [
+          {
+            "node": "Format Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Response": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {},
+  "versionId": "451c5669-f20f-4cde-90f9-a533b4322769",
+  "id": "9a0dd838-d52b-44ee-8c89-597ef81859fa",
+  "meta": {
+    "instanceId": "aurorachat-spec"
+  },
+  "tags": []
+}
